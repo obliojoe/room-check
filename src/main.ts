@@ -31,11 +31,9 @@ const AudioContextCtor =
   window.AudioContext ||
   (window as Window & typeof globalThis & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
-const hasAudioSupport =
-  typeof window !== 'undefined' &&
-  typeof navigator !== 'undefined' &&
-  !!AudioContextCtor &&
-  !!navigator.mediaDevices?.getUserMedia;
+const hasWindowSupport = typeof window !== 'undefined' && typeof navigator !== 'undefined';
+const hasMediaDevices = hasWindowSupport && !!navigator.mediaDevices?.getUserMedia;
+const hasAudioSupport = hasWindowSupport && !!AudioContextCtor && hasMediaDevices;
 
 const app = document.querySelector<HTMLDivElement>('#app');
 
@@ -58,6 +56,9 @@ app.innerHTML = `
       <div class="mode-row">
         <button class="secondary active" id="mode-sweep" type="button">Sweep mode</button>
         <button class="secondary" id="mode-clap" type="button">Clap mode</button>
+      </div>
+      <div style="margin-top: 16px;">
+        <button class="primary" id="request-mic-button" type="button">Request Mic Access</button>
       </div>
       <div class="button-row" style="margin-top: 12px;">
         <button class="primary" id="measure-button" type="button">Start measurement</button>
@@ -132,6 +133,7 @@ app.innerHTML = `
 `;
 
 const measureButton = document.querySelector<HTMLButtonElement>('#measure-button');
+const requestMicButton = document.querySelector<HTMLButtonElement>('#request-mic-button');
 const modeSweepButton = document.querySelector<HTMLButtonElement>('#mode-sweep');
 const modeClapButton = document.querySelector<HTMLButtonElement>('#mode-clap');
 const permissionDot = document.querySelector<HTMLSpanElement>('#permission-dot');
@@ -154,6 +156,7 @@ const observationsList = document.querySelector<HTMLUListElement>('#observations
 
 if (
   !measureButton ||
+  !requestMicButton ||
   !modeSweepButton ||
   !modeClapButton ||
   !permissionDot ||
@@ -198,6 +201,8 @@ const updateUi = (): void => {
       ? 'Start measurement'
       : 'Listen for clap';
   measureButton.disabled = state.isBusy || !hasAudioSupport;
+  requestMicButton.hidden = state.permission !== 'unknown' || !hasMediaDevices;
+  requestMicButton.disabled = state.isBusy;
 
   modeDescription.textContent =
     state.mode === 'sweep'
@@ -214,9 +219,11 @@ const updateUi = (): void => {
 
   progressFill.style.width = `${clamp(state.progress, 0, 1) * 100}%`;
   statusText.textContent = state.statusText;
-  supportWarning.textContent = hasAudioSupport
-    ? ''
-    : 'This browser does not expose the required Web Audio or microphone APIs.';
+  supportWarning.textContent = hasMediaDevices
+    ? hasAudioSupport
+      ? ''
+      : 'This browser does not expose the required Web Audio or microphone APIs.'
+    : 'Microphone requires HTTPS. Please access this app over https://';
 
   frequencySection.classList.toggle('hidden', state.mode === 'clap');
 };
@@ -282,6 +289,12 @@ const updateResults = (
 const withMicrophone = async <T>(
   handler: (context: AudioContext, stream: MediaStream) => Promise<T>
 ): Promise<T> => {
+  if (!hasMediaDevices) {
+    state.permission = 'unknown';
+    updateUi();
+    throw new Error('Microphone requires HTTPS. Please access this app over https://');
+  }
+
   const context = new AudioContextCtor();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -300,6 +313,64 @@ const withMicrophone = async <T>(
     throw error;
   } finally {
     await context.close().catch(() => undefined);
+  }
+};
+
+const setPermissionFromBrowser = (permissionState: PermissionState | 'prompt'): void => {
+  state.permission =
+    permissionState === 'granted'
+      ? 'granted'
+      : permissionState === 'denied'
+        ? 'denied'
+        : 'unknown';
+  updateUi();
+};
+
+const requestMicAccess = async (): Promise<void> => {
+  if (!hasMediaDevices || state.isBusy) {
+    return;
+  }
+
+  state.isBusy = true;
+  setProgress(0, 'Requesting microphone access...');
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach((track) => track.stop());
+    state.permission = 'granted';
+    setProgress(0, 'Microphone access granted.');
+  } catch (error) {
+    state.permission = 'denied';
+    const message = error instanceof Error ? error.message : 'Microphone access was denied.';
+    setProgress(0, message || 'Microphone access was denied.');
+  } finally {
+    state.isBusy = false;
+    updateUi();
+  }
+};
+
+const preflightMicrophonePermission = async (): Promise<void> => {
+  if (!hasMediaDevices) {
+    state.statusText = 'Microphone requires HTTPS. Please access this app over https://';
+    updateUi();
+    return;
+  }
+
+  if (!navigator.permissions?.query) {
+    updateUi();
+    return;
+  }
+
+  try {
+    const status = await navigator.permissions.query({
+      name: 'microphone' as PermissionName
+    });
+    setPermissionFromBrowser(status.state);
+    status.onchange = () => {
+      setPermissionFromBrowser(status.state);
+    };
+  } catch {
+    updateUi();
   }
 };
 
@@ -428,6 +499,10 @@ measureButton.addEventListener('click', () => {
   void startMeasurement();
 });
 
+requestMicButton.addEventListener('click', () => {
+  void requestMicAccess();
+});
+
 window.addEventListener('resize', () => {
   drawTimePlot(timeCanvas, state.lastTimeSeries);
   if (state.lastFrequency) {
@@ -442,3 +517,4 @@ window.addEventListener('resize', () => {
 });
 
 updateUi();
+void preflightMicrophonePermission();
