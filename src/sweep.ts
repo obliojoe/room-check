@@ -235,6 +235,141 @@ const absoluteArray = (signal: Float32Array): Float32Array => {
   return output;
 };
 
+const findPeakIndex = (signal: Float32Array): number => {
+  let peakIndex = 0;
+  let peakValue = -Infinity;
+
+  for (let i = 0; i < signal.length; i += 1) {
+    if (signal[i] > peakValue) {
+      peakValue = signal[i];
+      peakIndex = i;
+    }
+  }
+
+  return peakIndex;
+};
+
+const findEnvelopeCrossing = (
+  envelope: Float32Array,
+  threshold: number,
+  startIndex: number
+): number => {
+  for (let i = Math.max(startIndex, 1); i < envelope.length; i += 1) {
+    const previous = envelope[i - 1];
+    const current = envelope[i];
+    if (current > threshold) {
+      continue;
+    }
+    if (previous <= threshold || previous <= EPSILON) {
+      return i;
+    }
+
+    const ratio = clamp((previous - threshold) / Math.max(EPSILON, previous - current), 0, 1);
+    return i - 1 + ratio;
+  }
+
+  return -1;
+};
+
+const estimateDecayFromLogSlope = (
+  envelope: Float32Array,
+  sampleRate: number,
+  startIndex: number
+): number => {
+  const floorWindow = Math.max(8, Math.floor(envelope.length * 0.1));
+  let floor = 0;
+  for (let i = Math.max(startIndex, envelope.length - floorWindow); i < envelope.length; i += 1) {
+    floor += envelope[i];
+  }
+  floor /= floorWindow;
+
+  let count = 0;
+  let sumX = 0;
+  let sumY = 0;
+  let sumXX = 0;
+  let sumXY = 0;
+
+  for (let i = startIndex; i < envelope.length; i += 1) {
+    const value = envelope[i];
+    if (value <= Math.max(floor * 1.15, EPSILON)) {
+      continue;
+    }
+
+    const time = (i - startIndex) / sampleRate;
+    const logValue = Math.log(value);
+    count += 1;
+    sumX += time;
+    sumY += logValue;
+    sumXX += time * time;
+    sumXY += time * logValue;
+  }
+
+  if (count < 8) {
+    return clamp((envelope.length - startIndex) / sampleRate, 0.12, 4.5);
+  }
+
+  const denominator = count * sumXX - sumX * sumX;
+  if (Math.abs(denominator) <= EPSILON) {
+    return clamp((envelope.length - startIndex) / sampleRate, 0.12, 4.5);
+  }
+
+  const slope = (count * sumXY - sumX * sumY) / denominator;
+  if (!(slope < -EPSILON)) {
+    return clamp((envelope.length - startIndex) / sampleRate, 0.12, 4.5);
+  }
+
+  return clamp(6.90775527898 / -slope, 0.12, 4.5);
+};
+
+const fftBandFilter = (
+  signal: Float32Array,
+  sampleRate: number,
+  lowHz: number | null,
+  highHz: number | null
+): Float32Array => {
+  const size = nextPowerOfTwo(signal.length);
+  const padded = new Float32Array(size);
+  padded.set(signal);
+
+  const spectrum = fft(padded);
+  const binWidth = sampleRate / size;
+
+  for (let i = 0; i < size; i += 1) {
+    const mirroredIndex = i <= size / 2 ? i : size - i;
+    const frequency = mirroredIndex * binWidth;
+    const belowLow = lowHz !== null && frequency < lowHz;
+    const aboveHigh = highHz !== null && frequency > highHz;
+
+    if (belowLow || aboveHigh) {
+      spectrum.real[i] = 0;
+      spectrum.imag[i] = 0;
+    }
+  }
+
+  return fft(spectrum.real, spectrum.imag, true).real.slice(0, signal.length);
+};
+
+const filterBandSignal = (
+  signal: Float32Array,
+  sampleRate: number,
+  lowHz: number,
+  highHz: number
+): Float32Array => {
+  const kernel =
+    lowHz <= 200
+      ? makeLowPassKernel(sampleRate, highHz)
+      : highHz >= 8000
+        ? highPassFromLowPass(makeLowPassKernel(sampleRate, lowHz))
+        : bandPassKernel(sampleRate, lowHz, highHz);
+  const filtered = convolveSame(signal, kernel);
+
+  if (computePeak(filtered) > computePeak(signal) * 0.001) {
+    return filtered;
+  }
+
+  return fftBandFilter(signal, sampleRate, lowHz <= 200 ? null : lowHz, highHz >= 8000 ? null : highHz);
+};
+
 const estimateDecayFromSignal = (
   signal: Float32Array,
   sampleRate: number,
@@ -243,33 +378,24 @@ const estimateDecayFromSignal = (
   const envelope = movingAverage(absoluteArray(signal), Math.max(8, Math.floor(sampleRate * 0.012)));
   const start = clamp(onsetIndex, 0, Math.max(0, envelope.length - 1));
   const tail = envelope.slice(start);
-  const peak = Math.max(...tail, EPSILON);
-  const highThreshold = peak * 0.89125093813;
-  const lowThreshold = peak * 0.1;
+  if (!tail.length) {
+    return 0.12;
+  }
 
-  let t5 = -1;
-  let t20 = -1;
-  for (let i = 0; i < tail.length; i += 1) {
-    const value = tail[i];
-    if (t5 < 0 && value <= highThreshold) {
-      t5 = i;
+  const peakOffset = findPeakIndex(tail);
+  const decayStart = start + peakOffset;
+  const peak = Math.max(EPSILON, envelope[decayStart]);
+  const oneOverE = findEnvelopeCrossing(envelope, peak / Math.E, decayStart + 1);
+  const oneOverESquared = findEnvelopeCrossing(envelope, peak / (Math.E * Math.E), decayStart + 1);
+
+  if (oneOverE >= 0 && oneOverESquared > oneOverE) {
+    const tau = (oneOverESquared - oneOverE) / sampleRate;
+    if (tau > 0) {
+      return clamp(tau * 6.90775527898, 0.12, 4.5);
     }
-    if (t20 < 0 && value <= lowThreshold) {
-      t20 = i;
-      break;
-    }
   }
 
-  if (t5 >= 0 && t20 > t5) {
-    return clamp(((t20 - t5) / sampleRate) * 4, 0.12, 4.5);
-  }
-
-  const fallbackIndex = tail.findIndex((value) => value <= peak * 0.22387211385);
-  if (fallbackIndex >= 0) {
-    return clamp((fallbackIndex / sampleRate) * 2, 0.12, 4.5);
-  }
-
-  return clamp(tail.length / sampleRate, 0.12, 4.5);
+  return estimateDecayFromLogSlope(envelope, sampleRate, decayStart);
 };
 
 const estimateBandDecays = (
@@ -284,13 +410,7 @@ const estimateBandDecays = (
   ];
 
   return bandDefinitions.map((band) => {
-    const kernel =
-      band.low <= 200
-        ? makeLowPassKernel(sampleRate, band.high)
-        : band.high >= 8000
-          ? highPassFromLowPass(makeLowPassKernel(sampleRate, band.low))
-          : bandPassKernel(sampleRate, band.low, band.high);
-    const filtered = convolveSame(signal, kernel);
+    const filtered = filterBandSignal(signal, sampleRate, band.low, band.high);
     return {
       label: band.label,
       seconds: estimateDecayFromSignal(filtered, sampleRate, onsetIndex)

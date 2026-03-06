@@ -296,8 +296,9 @@ const withMicrophone = async <T>(
   }
 
   const context = new AudioContextCtor();
+  let stream: MediaStream | null = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: false,
         noiseSuppression: false,
@@ -308,11 +309,23 @@ const withMicrophone = async <T>(
     updateUi();
     return await handler(context, stream);
   } catch (error) {
-    state.permission = 'denied';
+    const errorName =
+      error instanceof DOMException
+        ? error.name
+        : typeof error === 'object' && error && 'name' in error
+          ? String(error.name)
+          : '';
+    state.permission = errorName === 'NotAllowedError' ? 'denied' : 'unknown';
     updateUi();
-    throw error;
+
+    if (errorName === 'NotAllowedError') {
+      throw error;
+    }
+
+    throw new Error('Microphone busy — please try again.');
   } finally {
     await context.close().catch(() => undefined);
+    stream?.getTracks().forEach((track) => track.stop());
   }
 };
 
@@ -402,7 +415,6 @@ const recordStream = (
       window.clearInterval(interval);
       processor.disconnect();
       source.disconnect();
-      stream.getTracks().forEach((track) => track.stop());
       resolve(mergeBuffers(chunks));
     }, durationSeconds * 1000);
   });
